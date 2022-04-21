@@ -6,6 +6,13 @@
 - policy evaluation
 
 ## TODO
-- vanlilla gradient descent
+- vgp doesn't perform well
+- add actor critic (reduce variance)
 
 
+## Quickstart
+Policy iteration
+`python3 agent.py --policy pi`
+
+Vanilla Gradient Policy
+`python3 agent.py --policy vgp`

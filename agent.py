@@ -2,6 +2,10 @@ import numpy as np
 from environment import Environment
 from IPython import embed as e
 import matplotlib.pyplot as plt
+import torch.nn as nn
+from torch.distributions.categorical import Categorical
+import torch
+import argparse
 
 action_map = ['down', 'up', 'left', 'right']
 
@@ -27,7 +31,7 @@ class DetermPolicy:
                 self.probs[r][c][act] = 1
 
     def prob(self, state, action):
-        return self.probs[state[0], state[1], action]
+        return self.probs[int(state[0]), int(state[1]), action]
     
     def act(self, state):
         action = -1
@@ -49,6 +53,10 @@ class DetermPolicy:
     
     def backprop(self, loss):
         pass
+
+"""
+    Dynamic Programming
+"""
 
 def policy_evaluation(env, policy, gamma=0.9, tol = 1e-4):
     env.reset()
@@ -85,8 +93,9 @@ def policy_evaluation(env, policy, gamma=0.9, tol = 1e-4):
 def plot_grid(V, env, policy, fig_size=8):
     # Visualize
     fig, ax = plt.subplots(figsize=(fig_size, fig_size))
-    # print(plt.get_cmap('plasma'))
-    p = ax.imshow(V, cmap=plt.get_cmap('plasma'))
+    # # print(plt.get_cmap('plasma'))
+    print(V)
+    p = ax.imshow(V)
     # fig = plt.gcf()
     # ax = plt.gca()
     for (i_, j_), d in np.ndenumerate(V):
@@ -99,10 +108,11 @@ def plot_grid(V, env, policy, fig_size=8):
                 if (s == end_state[0]).all():
                     disp_string += "End\n"
 
-        ax.text(j_, i_, disp_string + 'v={:0.2f}\n{}'.format(d, action_map[policy.act([i_, j_])]), ha='center', va='center',
+        ax.text(j_, i_, disp_string + 'v={:0.2f}\n{}'.format(d, action_map[policy.act(torch.tensor([i_, j_], dtype=torch.float32))]), ha='center', va='center',
         bbox=dict(boxstyle='round', facecolor='white', edgecolor='0.3'))
     ax.title.set_text("Simple grid world")
     plt.show()
+    
 
 def policy_improvement(env, V, policy, gamma=0.9):
     for i in range(1000):
@@ -133,9 +143,165 @@ def policy_improvement(env, V, policy, gamma=0.9):
         if policy_stable: break
 
     return policy
+
+"""
+    Vanilla Gradient Policy
+"""
+
+def mlp(sizes, activation, output_act=nn.Identity):
+    layers = []
+    for j in range(len(sizes) - 1):
+        act = activation if j < len(sizes) - 2 else output_act
+        layers += [nn.Linear(sizes[j], sizes[j+1]), act()]
+    
+    return nn.Sequential(*layers)
+
+
+class Actor(nn.Module):
+    def __init__(self, obs_dim, hidden_sizes, action_dim, activation=nn.Tanh):
+        super().__init__()
+        self.net = mlp([obs_dim] + list(hidden_sizes) +[action_dim], activation)
+
+    def _distribution(self, obs):
+        logits = self.net(obs)
+        return Categorical(logits = logits)
+    
+    # def _log_prob(self, obs, act):
+    #     pi = self._distribution(obs)
+    #     return pi.log_prob(act)
+
+    def forward(self, obs, action=None):
+        pi = self._distribution(obs)
+
+        logp_a = None
+        if action is not None:
+            logp_a = pi.log_prob(action)
+        return pi, logp_a
+
+class Critic(nn.Module):
+    def __init__(self, obs_dim, hidden_sizes, activation):
+        super().__init__()
+        self.net = mlp([obs_dim] + list(hidden_sizes) + [1], activation)
+
+    def forward(self,obs):
+        return torch.squeeze(self.net(obs), -1)
+
+class ActorCritic(nn.Module):
+    def __init__(self, obs_dim, hidden_sizes, act_dim):
+        super().__init__()
+
+        activation = nn.Tanh
+
+        self.pi = Actor(obs_dim, hidden_sizes, act_dim, activation)
+        self.v = Critic(obs_dim, hidden_sizes, activation)
+    
+    def step(self, obs):
+        with torch.no_grad():
+            pi = self.pi._distribution(obs)
+            a = pi.sample()
+
+            log_prob_a = pi.log_prob(a)
+            v = self.v(obs)
+
+        return a.numpy(), v.numpy(), log_prob_a.numpy()
+    
+    def act(self, obs):
+        return self.step(obs)[0]
+
+
+def vgp(env:Environment, hidden_sizes=[64, 64], epochs=50, batch_size=32, lr=1e-2):
+    model = ActorCritic(env.obs_dim, list(hidden_sizes), env.act_dim)
+
+    actor_optim = torch.optim.AdamW(model.pi.parameters(), lr = lr)
+    critic_optim = torch.optim.AdamW(model.v.parameters(), lr = lr)
+
+    
+    def compute_pi_loss(model, obs, action, weights):
+        obs = torch.tensor(obs,dtype=torch.float32)
+        action = torch.tensor(action,dtype=torch.float32)
+        weights = torch.tensor(weights,dtype=torch.float32)
+        logp = model.pi(obs, action)[1]
+        return -(logp * (weights + 1)).mean()
+
+
+    def train_one_epoch():
+        batch_obs = []
+        batch_acts = []
+        batch_weights = []
+        batch_rew = []
+        batch_lengths = []
+        batch_vals = []
+
+        state = env.reset()
+
+        eps_rew = []
+        eps_vals = []
+
+        while True:
+            act, v, log_prob_a = model.step(torch.tensor(state, dtype=torch.float32))
+            new_state, rewards, done = env.step(act)
+            
+            eps_rew.append(rewards)
+            eps_vals.append(v)
+
+            batch_acts.append(act)
+            batch_obs.append(state.copy())
+
+            state = new_state
+
+            if done or len(eps_rew) > 100:
+                state = env.reset()
+
+                eps_len = len(eps_rew)
+                eps_sum = np.sum(eps_rew)
+
+                # finish_path(eps_rew, eps_vals)
+
+                # Advantage function
+                # eps_rew -= eps_vals
+       
+                # What is weights?
+                batch_weights += [eps_sum] * eps_len
+               
+                # batch_weights += eps_rew
         
+                batch_lengths.append(eps_len)
+                batch_rew.append(np.sum(eps_rew))
+
+                eps_rew = []
+
+
+                if len(batch_obs) > batch_size:
+                    break
+        
+        # Compute loss and update parameters after certain batche size
+        actor_optim.zero_grad()
+        pi_batch_loss = compute_pi_loss(
+            model = model,
+            obs = np.array(batch_obs),
+            action = np.array(batch_acts),
+            weights = np.array(batch_weights)
+        )
+        pi_batch_loss.backward()
+        actor_optim.step()
+
+
+
+        return pi_batch_loss, batch_rew, batch_lengths
+
+    for epoch in range(epochs):
+        batch_loss, batch_rew, batch_lengths = train_one_epoch()
+        print("epoch %3d \t loss %.2f \t return %.2f \t lengths %.2f " \
+                % (epoch, batch_loss, np.mean(batch_rew), np.mean(batch_lengths)))
+    plot_grid(env.get_V(), env, model)
+    
 
 if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--policy', type=str, default='pi', help="[pi, vgp]")
+    args = parser.parse_args()
+
     policy = RandomWalk()
     n=10
     env = Environment(n, n)
@@ -143,17 +309,23 @@ if __name__ == '__main__':
     agent = DetermPolicy((n,n))
     # print(agent.probs)
 
+    if args.policy=='vgp':
+        vgp(env, [256, 256], epochs=100, lr=1e-5)
+    elif args.policy=='pi':
+    # exit(0)
     
-    V = policy_evaluation(env, agent)
-    for i in range(20):
-        print(f"Iteration {i}")
-        last_V = V.copy()
-        agent = policy_improvement(env, V, agent)
         V = policy_evaluation(env, agent)
+        for i in range(20):
+            print(f"Iteration {i}")
+            last_V = V.copy()
+            agent = policy_improvement(env, V, agent)
+            V = policy_evaluation(env, agent)
 
-        print("Change:", np.linalg.norm(V - last_V))
-        if np.linalg.norm(V - last_V) < 1e-4:
-            break
-    plot_grid(V, env, agent)
+            print("Change:", np.linalg.norm(V - last_V))
+            if np.linalg.norm(V - last_V) < 1e-4:
+                break
+        plot_grid(V, env, agent)
+    else:
+        print("Implemented algorithms are pi (policy iteration) and vgp (Vanilla Gradient Policy)")
 
     
